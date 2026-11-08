@@ -1,0 +1,19 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: backend-syntax
+      glob: "backend/**/*.py"
+      run: python -m compileall -q backend/app
+    - name: frontend-typecheck
+      glob: "frontend/**/*.{ts,tsx}"
+      root: "frontend/"
+      run: npx --no-install tsc --noEmit
+
+pre-push:
+  jobs:
+    - name: backend-tests
+      root: "backend/"
+      run: python -m pytest -q
+    - name: frontend-lint-typecheck
+      root: "frontend/"
+      run: npm run lint && npx --no-install tsc --noEmit
