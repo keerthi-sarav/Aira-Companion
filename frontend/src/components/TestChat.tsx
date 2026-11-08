@@ -71,6 +71,39 @@ interface PendingTurn {
   outputs: Record<string, string>; // call id -> JSON text typed by the user
 }
 
+/** Generated key for a message that has no server id yet. Never collides with a server id. */
+function newLocalKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `local-${crypto.randomUUID()}`;
+  }
+  return `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function makeItem(
+  role: "user" | "assistant",
+  content: string,
+  mood: HistoryMessage["mood"] = null,
+  id?: string,
+): HistoryMessage {
+  return {
+    id: id ?? newLocalKey(),
+    role,
+    content,
+    mood,
+    created_at: new Date().toISOString(),
+  };
+}
+
+/** Keeps the first item for each id so every rendered key is unique. */
+function uniqueById(items: HistoryMessage[]): HistoryMessage[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+}
+
 export default function TestChat({ companionId }: { companionId: string }) {
   const [messages, setMessages] = useState<HistoryMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
@@ -82,18 +115,6 @@ export default function TestChat({ companionId }: { companionId: string }) {
   const [notice, setNotice] = useState<string | null>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
-  const localIdRef = useRef(0);
-
-  function makeItem(role: "user" | "assistant", content: string, mood: HistoryMessage["mood"] = null, id?: string): HistoryMessage {
-    localIdRef.current += 1;
-    return {
-      id: id ?? `local-${localIdRef.current}`,
-      role,
-      content,
-      mood,
-      created_at: new Date().toISOString(),
-    };
-  }
 
   // Load history whenever the companion changes.
   useEffect(() => {
@@ -106,7 +127,7 @@ export default function TestChat({ companionId }: { companionId: string }) {
     api
       .getTestChatHistory(companionId)
       .then((items) => {
-        if (!cancelled) setMessages(items);
+        if (!cancelled) setMessages(uniqueById(items));
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(errorText(err));
@@ -128,7 +149,7 @@ export default function TestChat({ companionId }: { companionId: string }) {
   function applyReply(reply: CompanionReply) {
     if (reply.text) {
       const item = makeItem("assistant", reply.text, reply.mood, reply.message_id ?? undefined);
-      setMessages((prev) => [...prev, item]);
+      setMessages((prev) => [...prev.filter((m) => m.id !== item.id), item]);
     }
     if (reply.status === "tool_call" && reply.turn_id) {
       setPending({
@@ -144,7 +165,8 @@ export default function TestChat({ companionId }: { companionId: string }) {
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const text = draft.trim();
-    if (!text || sending || pending) return;
+    // Not while history loads: the history response replaces the list, which would drop this message.
+    if (!text || sending || pending || historyLoading) return;
 
     let tools: AppTool[];
     try {
@@ -348,11 +370,15 @@ export default function TestChat({ companionId }: { companionId: string }) {
           maxLength={8000}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          disabled={sending || waiting}
+          disabled={sending || waiting || historyLoading}
           placeholder={waiting ? "Send the tool result first" : "Type a message"}
           className="input"
         />
-        <button type="submit" className="btn btn-primary" disabled={sending || waiting || draft.trim() === ""}>
+        <button
+          type="submit"
+          className="btn btn-primary"
+          disabled={sending || waiting || historyLoading || draft.trim() === ""}
+        >
           Send
         </button>
       </form>

@@ -8,8 +8,14 @@ from app.companion import engine
 from app.companion.errors import CompanionPaused
 from app.companion.engine import reply
 from app.companion.llm import LLMResult, OpenAICompatLLM
-from app.companion.models import CompanionEndUser, CompanionMessage, CompanionPendingTurn, utcnow
-from app.companion.schemas import ToolCall
+from app.companion.models import (
+    CompanionConversation,
+    CompanionEndUser,
+    CompanionMessage,
+    CompanionPendingTurn,
+    utcnow,
+)
+from app.companion.schemas import TOOL_OUTPUT_MAX_CHARS, ToolCall
 from app.core.config import get_settings
 from helpers import BASE, TENANT_A, TENANT_B, hdr, make_companion, post_test_chat, set_status
 
@@ -39,20 +45,36 @@ class MoodLLM:
 
 
 class ToolForeverLLM:
-    """Asks for a tool whenever tools are offered. Used to prove the 3-round cap."""
+    """Asks for a tool whenever tools are offered. Used to prove the 3-round cap.
+
+    Obeys tool_choice="none" (returns text), as a well-behaved model does.
+    """
 
     configured = True
 
     def __init__(self):
         self.tools_seen: list = []
+        self.tool_choices: list = []
 
-    async def chat(self, messages, *, tools=None, **_):
+    async def chat(self, messages, *, tools=None, tool_choice=None, **_):
         self.tools_seen.append(tools)
-        if tools:
+        self.tool_choices.append(tool_choice)
+        if tools and tool_choice != "none":
             return LLMResult(
                 text=None,
                 tool_calls=[ToolCall(id=f"c{len(self.tools_seen)}", name="get_chart", args={})],
             )
+        return LLMResult(text="[mood: calm] Final answer.")
+
+
+class ToolIgnoringLLM:
+    """Ignores tool_choice and keeps asking for tools. The engine must still not pause in the final round."""
+
+    configured = True
+
+    async def chat(self, messages, *, tools=None, **_):
+        if tools:
+            return LLMResult(text=None, tool_calls=[ToolCall(id="late", name="get_chart", args={})])
         return LLMResult(text="[mood: calm] Final answer.")
 
 
@@ -192,8 +214,30 @@ async def test_three_round_cap_sends_round_three_without_tools(client, llm_box):
     assert body["status"] == "done"
     assert body["text"] == "Final answer."
     assert len(llm.tools_seen) == 3
-    assert llm.tools_seen[0] and llm.tools_seen[1]
-    assert llm.tools_seen[2] is None
+    # Final round still carries the tools (so tool messages stay valid) but forbids calling them.
+    assert llm.tools_seen[0] and llm.tools_seen[1] and llm.tools_seen[2]
+    assert llm.tool_choices == [None, None, "none"]
+
+
+async def test_final_round_ignores_tool_calls_the_model_returns_anyway(client, llm_box):
+    llm_box["llm"] = ToolIgnoringLLM()
+    companion = await make_companion(client, fallback_line="Konjam wait pannunga.")
+
+    first = await post_test_chat(client, companion["id"], "chart please", tools=[CHART_TOOL])
+    second = await client.post(
+        f"{BASE}/test-chat/continue",
+        json={"turn_id": first.json()["turn_id"], "results": []},
+        headers=hdr(),
+    )
+    assert second.json()["status"] == "tool_call"
+    third = await client.post(
+        f"{BASE}/test-chat/continue",
+        json={"turn_id": second.json()["turn_id"], "results": []},
+        headers=hdr(),
+    )
+    body = third.json()
+    assert body["status"] == "done"
+    assert body["text"] == "Konjam wait pannunga."
 
 
 async def test_missing_tool_result_gets_tool_unavailable(client, llm_box):
@@ -361,3 +405,70 @@ async def test_forget_me_wipes_all_companions_of_tenant_only(client, db, llm_box
 async def test_forget_for_unknown_person_is_204(client):
     response = await client.post(f"{BASE}/end-users/nobody/forget", headers=hdr())
     assert response.status_code == 204
+
+
+# ---------- rollover, knowledge failure, tool output cap ----------
+
+async def test_24h_silence_opens_new_conversation_and_carries_mood_over(client, db, llm_box):
+    llm_box["llm"] = MoodLLM()
+    companion = await make_companion(client)
+    cid = companion["id"]
+    first = (await post_test_chat(client, cid, "I am happy today")).json()
+    assert first["mood"] == "happy"
+
+    async with db() as session:
+        await session.execute(
+            update(CompanionConversation)
+            .where(CompanionConversation.companion_id == cid)
+            .values(last_message_at=utcnow() - timedelta(hours=25))
+        )
+        await session.commit()
+
+    second = (await post_test_chat(client, cid, "tell me more")).json()
+    assert second["conversation_id"] != first["conversation_id"]
+    assert second["mood"] == "happy"
+    assert "Your current mood with this user: happy." in llm_box["llm"].calls[-1][0]["content"]
+
+    async with db() as session:
+        rows = (
+            await session.execute(
+                select(CompanionConversation)
+                .where(CompanionConversation.companion_id == cid)
+                .order_by(CompanionConversation.created_at)
+            )
+        ).scalars().all()
+    assert len(rows) == 2
+    assert rows[1].id == second["conversation_id"]
+    assert rows[1].mood == "happy"
+
+
+class ExplodingKnowledge:
+    async def get_context(self, tenant_id, message, tag_id):
+        raise RuntimeError("knowledge store unreachable")
+
+
+async def test_knowledge_provider_failure_still_gets_a_reply(client, llm_box, monkeypatch):
+    monkeypatch.setattr(engine, "knowledge_provider", ExplodingKnowledge())
+    companion = await make_companion(client, knowledge_tag_id="astro-books")
+    response = await post_test_chat(client, companion["id"], "hello")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "done"
+    assert body["text"] == "(echo) hello"
+    assert "=== KNOWLEDGE ===" + chr(10) + "none" in llm_box["llm"].calls[-1]["messages"][0]["content"]
+
+
+async def test_tool_output_over_cap_is_truncated_in_replayed_messages(client, llm_box):
+    companion = await make_companion(client)
+    paused = await _pause_with_chart(client, companion["id"])
+    [call] = paused["tool_calls"]
+    response = await client.post(
+        f"{BASE}/test-chat/continue",
+        json={"turn_id": paused["turn_id"], "results": [{"id": call["id"], "output": "x" * 10_000}]},
+        headers=hdr(),
+    )
+    assert response.status_code == 200, response.text
+    tool_msg = llm_box["llm"].calls[-1]["messages"][-1]
+    assert tool_msg["role"] == "tool"
+    assert len(tool_msg["content"]) == TOOL_OUTPUT_MAX_CHARS
+    assert tool_msg["content"].startswith('"xxx')

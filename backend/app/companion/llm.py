@@ -26,6 +26,7 @@ class LLMClient(Protocol):
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
         max_tokens: int = 700,
         temperature: float = 0.5,
         purpose: str = "companion_reply",
@@ -81,6 +82,7 @@ class OpenAICompatLLM:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
         max_tokens: int = 700,
         temperature: float = 0.5,
         purpose: str = "companion_reply",
@@ -93,6 +95,8 @@ class OpenAICompatLLM:
         }
         if tools:
             payload["tools"] = tools
+            if tool_choice:
+                payload["tool_choice"] = tool_choice  # "none" = tools are visible but must not be called
         async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
             response = await client.post(
                 f"{self._base_url}/chat/completions",
@@ -132,15 +136,16 @@ class FakeLLM:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
         max_tokens: int = 700,
         temperature: float = 0.5,
         purpose: str = "companion_reply",
     ) -> LLMResult:
-        self.calls.append({"messages": list(messages), "tools": tools})
+        self.calls.append({"messages": list(messages), "tools": tools, "tool_choice": tool_choice})
         last_user_index = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=-1)
         last_user = messages[last_user_index]["content"] if last_user_index >= 0 else ""
         tool_result_seen = any(m["role"] == "tool" for m in messages[last_user_index + 1:])
-        if tools and "chart" in last_user.lower() and not tool_result_seen:
+        if tools and tool_choice != "none" and "chart" in last_user.lower() and not tool_result_seen:
             name = tools[0]["function"]["name"]
             call = ToolCall(id=f"call_{uuid.uuid4().hex[:12]}", name=name, args={})
             return LLMResult(text=None, tool_calls=[call])

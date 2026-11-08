@@ -7,7 +7,7 @@ import CharacterForm from "@/components/CharacterForm";
 import StatusBadge from "@/components/StatusBadge";
 import TestChat from "@/components/TestChat";
 import { api, errorText } from "@/lib/api";
-import { INDUSTRY_LABELS } from "@/lib/companion";
+import { INDUSTRY_LABELS, pickFormValues } from "@/lib/companion";
 import type { CompanionFormValues, CompanionRead, Status } from "@/lib/types";
 
 const STATUS_OPTIONS: { value: Status; help: string }[] = [
@@ -23,6 +23,7 @@ export default function CompanionDetailPage({ params }: { params: { id: string }
   const [companion, setCompanion] = useState<CompanionRead | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [statusBusy, setStatusBusy] = useState(false);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -43,15 +44,22 @@ export default function CompanionDetailPage({ params }: { params: { id: string }
     };
   }, [id]);
 
+  // Save and status change are serialized: each one's response overwrites the companion state,
+  // so the two must never be in flight at once or the slower response would revert the other.
   async function saveCard(values: CompanionFormValues) {
     setNotice(null);
-    const updated = await api.updateCompanion(id, values);
-    setCompanion(updated);
-    setNotice("Saved.");
+    setSaving(true);
+    try {
+      const updated = await api.updateCompanion(id, values);
+      setCompanion(updated);
+      setNotice("Saved.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   async function changeStatus(status: Status) {
-    if (!companion || companion.status === status) return;
+    if (!companion || companion.status === status || saving || statusBusy) return;
     setStatusBusy(true);
     setStatusError(null);
     try {
@@ -121,9 +129,10 @@ export default function CompanionDetailPage({ params }: { params: { id: string }
               </div>
             ) : null}
             <CharacterForm
-              initial={companion}
+              initial={pickFormValues(companion)}
               submitLabel="Save changes"
               onSubmit={saveCard}
+              disabled={statusBusy}
             />
           </section>
 
@@ -137,7 +146,7 @@ export default function CompanionDetailPage({ params }: { params: { id: string }
                     key={option.value}
                     type="button"
                     aria-pressed={active}
-                    disabled={statusBusy}
+                    disabled={statusBusy || saving}
                     onClick={() => void changeStatus(option.value)}
                     className={`rounded-md px-3 py-1.5 text-sm font-medium capitalize disabled:opacity-50 ${
                       active ? "bg-neutral-900 text-white" : "text-neutral-700 hover:bg-neutral-100"
@@ -171,7 +180,8 @@ export default function CompanionDetailPage({ params }: { params: { id: string }
         </div>
 
         <div className="lg:sticky lg:top-6 lg:self-start">
-          <TestChat companionId={id} />
+          {/* key resets chat state and drops in-flight replies when the route moves to another companion. */}
+          <TestChat key={id} companionId={id} />
         </div>
       </div>
     </div>

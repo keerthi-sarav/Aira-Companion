@@ -84,13 +84,15 @@ export interface CompanionReply {
   tool_calls: ToolCall[];
 }
 
-/** One item from GET /{id}/test-chat/history. */
+/** One item from GET /{id}/test-chat/history. `id` is always set; local items get a generated key. */
 export interface HistoryMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   mood: Mood | null;
   created_at: string;
+  /** Names and args only, never tool output. Present on messages where the companion asked for tools. */
+  tool_calls?: { name: string; args: Record<string, unknown> }[] | null;
 }
 
 /** Error body returned for every domain error: {error, message}. */

@@ -82,6 +82,18 @@ def build_system_prompt(
     return "\n\n".join(sections)
 
 
+def _collapse_user_runs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join consecutive user messages with a newline. A discarded or expired tool turn can leave one behind."""
+    collapsed: list[dict[str, Any]] = []
+    for message in messages:
+        if collapsed and message["role"] == "user" and collapsed[-1]["role"] == "user":
+            joined = collapsed[-1]["content"] + "\n" + message["content"]
+            collapsed[-1] = {"role": "user", "content": joined}
+        else:
+            collapsed.append(dict(message))
+    return collapsed
+
+
 def build_messages(
     companion: Any,
     mood: str,
@@ -96,4 +108,4 @@ def build_messages(
     ]
     messages.extend({"role": item["role"], "content": item["content"]} for item in history)
     messages.append({"role": "user", "content": user_message})
-    return messages
+    return _collapse_user_runs(messages)

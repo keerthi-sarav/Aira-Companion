@@ -1,4 +1,9 @@
-"""Reply engine (ARCHITECTURE.md sections 6 and 7). reply() starts a turn, continue_reply() resumes a paused one."""
+"""Reply engine (ARCHITECTURE.md sections 6 and 7). reply() starts a turn, continue_reply() resumes a paused one.
+
+Transactions: every write is committed before the LLM call, so no DB write lock is held while the model runs.
+  reply:          [user msg committed] -> LLM -> [pending turn | assistant msg + mood committed]
+  continue_reply: [turn claimed and committed] -> LLM -> [assistant msg + mood committed]
+"""
 
 import asyncio
 import json
@@ -19,7 +24,7 @@ from app.companion.knowledge import knowledge_provider
 from app.companion.llm import LLMClient, LLMResult, app_tools_to_openai, get_llm
 from app.companion.memory import memory_provider
 from app.companion.mood import parse_mood
-from app.companion.models import Companion, CompanionConversation, CompanionPendingTurn, utcnow
+from app.companion.models import Companion, CompanionConversation, utcnow
 from app.companion.schemas import (
     MESSAGE_MAX_CHARS,
     TOOL_OUTPUT_MAX_CHARS,
@@ -32,7 +37,7 @@ from app.core.config import get_settings
 
 log = logging.getLogger("aira.companion.engine")
 
-MAX_ROUNDS = 3  # round 3 is sent without tools so the model must answer
+MAX_ROUNDS = 3  # the final round is sent with tools visible but tool_choice="none", so the model must answer
 HISTORY_LIMIT = 10
 MAX_TOKENS = 700
 TEMPERATURE = 0.5
@@ -81,12 +86,18 @@ async def _gather_context(tenant_id: str, companion: Companion, end_user_id: str
     return kb_context, memory_context
 
 
-async def _chat(llm: LLMClient, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> LLMResult | None:
+async def _chat(
+    llm: LLMClient,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str | None = None,
+) -> LLMResult | None:
     """None means the call failed. The caller then sends the companion's fallback line."""
     try:
         return await llm.chat(
             messages,
             tools=tools or None,
+            tool_choice=tool_choice if tools else None,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
             purpose="companion_reply",
@@ -133,7 +144,6 @@ def _calls_log(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 async def _conclude(
     session: AsyncSession,
-    tenant_id: str,
     companion: Companion,
     conversation: CompanionConversation,
     messages: list[dict[str, Any]],
@@ -141,9 +151,15 @@ async def _conclude(
     tools_offered: list[dict[str, Any]],
     round_no: int,
 ) -> CompanionReply:
-    """Steps 7-9: pause for tools, or parse the mood and save the reply."""
+    """Steps 7-9: pause for tools, or parse the mood and save the reply. Each branch commits once."""
     allowed_names = {tool["function"]["name"] for tool in tools_offered}
-    requested = [call for call in (result.tool_calls if result else []) if call.name in allowed_names]
+    final_round = round_no >= MAX_ROUNDS
+    # In the final round tool calls are ignored even if the model returns them anyway.
+    requested = (
+        []
+        if final_round
+        else [call for call in (result.tool_calls if result else []) if call.name in allowed_names]
+    )
 
     if requested:
         assistant_message = {
@@ -160,7 +176,7 @@ async def _conclude(
         }
         turn = await store.create_pending_turn(
             session,
-            tenant_id,
+            companion.tenant_id,
             companion.id,
             conversation.id,
             [*messages, assistant_message],
@@ -229,6 +245,9 @@ async def reply(
         end_user = await store.get_or_create_end_user(session, tenant_id, external_user_id, display_name)
         conversation = await store.get_or_open_conversation(session, tenant_id, companion, end_user.id, now)
         history = await store.recent_history(session, tenant_id, companion.id, end_user.id, HISTORY_LIMIT)
+        await store.add_message(session, conversation, "user", text_in)
+        await session.commit()  # release the write lock before the LLM call
+
         kb_context, memory_context = await _gather_context(tenant_id, companion, end_user.id, text_in)
         messages = prompt.build_messages(
             companion,
@@ -238,14 +257,11 @@ async def reply(
             [{"role": item.role, "content": item.content} for item in history],
             text_in,
         )
-        await store.add_message(session, conversation, "user", text_in)
         result = await _chat(client, messages, openai_tools)
     finally:
         semaphore.release()
 
-    return await _conclude(
-        session, tenant_id, companion, conversation, messages, result, openai_tools, round_no=1
-    )
+    return await _conclude(session, companion, conversation, messages, result, openai_tools, round_no=1)
 
 
 async def continue_reply(
@@ -256,31 +272,32 @@ async def continue_reply(
     *,
     llm: LLMClient | None = None,
 ) -> CompanionReply:
-    now = utcnow()
-    await store.sweep_expired_turns(session, tenant_id, now)
-    await session.commit()  # keep the sweep even when this call ends in TurnExpired
-    turn: CompanionPendingTurn | None = await store.get_pending_turn(session, tenant_id, turn_id, now)
-    if turn is None:
-        raise TurnExpired()
-    companion = await store.get_companion(session, tenant_id, turn.companion_id)
-    conversation = await store.get_conversation(session, tenant_id, turn.conversation_id)
-    if companion is None or conversation is None:
-        raise TurnExpired()
     client = llm if llm is not None else get_llm()
     if not client.configured:
         raise CompanionMisconfigured()
 
-    messages = _apply_results(list(turn.messages), results)
-    round_no = turn.round + 1
-    tools = list(turn.tools) if round_no < MAX_ROUNDS else []
-    await store.delete_pending_turn(session, turn)
-
     semaphore = await _acquire_slot()
     try:
-        result = await _chat(client, messages, tools)
+        now = utcnow()
+        await store.sweep_expired_turns(session, now)
+        turn = await store.claim_pending_turn(session, tenant_id, turn_id, now)
+        if turn is None:
+            await session.commit()  # keeps the sweep; the claim matched nothing (expired, unknown, or taken)
+            raise TurnExpired()
+        companion = await store.get_companion(session, tenant_id, turn.companion_id)
+        conversation = await store.get_conversation(session, tenant_id, turn.conversation_id)
+        if companion is None or conversation is None:
+            await session.commit()
+            raise TurnExpired()
+
+        messages = _apply_results(list(turn.messages), results)
+        round_no = turn.round + 1
+        tools = list(turn.tools)
+        final_round = round_no >= MAX_ROUNDS
+        await session.commit()  # the claim is durable before the LLM call
+
+        result = await _chat(client, messages, tools, tool_choice="none" if final_round else None)
     finally:
         semaphore.release()
 
-    return await _conclude(
-        session, tenant_id, companion, conversation, messages, result, tools, round_no=round_no
-    )
+    return await _conclude(session, companion, conversation, messages, result, tools, round_no=round_no)

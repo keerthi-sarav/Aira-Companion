@@ -1,6 +1,6 @@
 import json
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -13,6 +13,11 @@ DEFAULT_FALLBACK_LINE = "Sorry, I can't answer right now. Please try again in a 
 MESSAGE_MAX_CHARS = 8000
 TOOL_OUTPUT_MAX_CHARS = 4000
 TOOL_PARAMETERS_MAX_BYTES = 4096
+LIST_ITEM_MAX_CHARS = 500  # per sample line, goal and rule (Postgres column limit)
+FALLBACK_LINE_MAX_CHARS = 500
+KNOWLEDGE_TAG_MAX_CHARS = 64
+
+ListItem = Annotated[str, Field(max_length=LIST_ITEM_MAX_CHARS)]
 
 
 class CharacterCard(BaseModel):
@@ -22,17 +27,17 @@ class CharacterCard(BaseModel):
     speaking_style: str = Field(default="", max_length=1000)
     temperament: str = Field(default="", max_length=200)
     language: str = Field(default="English", max_length=40)
-    sample_lines: list[str] = Field(default_factory=list, max_length=10)
-    goals: list[str] = Field(default_factory=list, max_length=5)
-    rules: list[str] = Field(default_factory=list, max_length=30)
+    sample_lines: list[ListItem] = Field(default_factory=list, max_length=10)
+    goals: list[ListItem] = Field(default_factory=list, max_length=5)
+    rules: list[ListItem] = Field(default_factory=list, max_length=30)
 
 
 class CompanionCreate(CharacterCard):
     industry: Industry = "general"
     default_mood: Mood = "calm"
-    knowledge_tag_id: str | None = None
+    knowledge_tag_id: str | None = Field(default=None, max_length=KNOWLEDGE_TAG_MAX_CHARS)
     privacy_mode: PrivacyMode = "B"
-    fallback_line: str = DEFAULT_FALLBACK_LINE
+    fallback_line: str = Field(default=DEFAULT_FALLBACK_LINE, max_length=FALLBACK_LINE_MAX_CHARS)
 
 
 class CompanionUpdate(BaseModel):
@@ -44,14 +49,14 @@ class CompanionUpdate(BaseModel):
     speaking_style: str | None = Field(default=None, max_length=1000)
     temperament: str | None = Field(default=None, max_length=200)
     language: str | None = Field(default=None, max_length=40)
-    sample_lines: list[str] | None = Field(default=None, max_length=10)
-    goals: list[str] | None = Field(default=None, max_length=5)
-    rules: list[str] | None = Field(default=None, max_length=30)
+    sample_lines: list[ListItem] | None = Field(default=None, max_length=10)
+    goals: list[ListItem] | None = Field(default=None, max_length=5)
+    rules: list[ListItem] | None = Field(default=None, max_length=30)
     industry: Industry | None = None
     default_mood: Mood | None = None
-    knowledge_tag_id: str | None = None
+    knowledge_tag_id: str | None = Field(default=None, max_length=KNOWLEDGE_TAG_MAX_CHARS)
     privacy_mode: PrivacyMode | None = None
-    fallback_line: str | None = None
+    fallback_line: str | None = Field(default=None, max_length=FALLBACK_LINE_MAX_CHARS)
     status: Status | None = None
 
 
@@ -114,6 +119,7 @@ class CompanionReply(BaseModel):
 class ChatMessageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    id: str
     role: Literal["user", "assistant"]
     content: str
     mood: Mood | None = None

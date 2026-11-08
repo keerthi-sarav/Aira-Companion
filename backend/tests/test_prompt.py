@@ -107,3 +107,15 @@ def test_mood_and_output_sections_render_current_mood():
     system = system_text(build_messages(fake_companion(), "serious", "", "", [], "Hi"))
     assert "Your current mood with this user: serious." in system
     assert "[mood: X]" in system and "calm, warm, happy, concerned, encouraging, serious" in system
+
+
+def test_consecutive_user_messages_are_joined_so_roles_alternate():
+    # An expired tool turn can leave a user message with no assistant reply behind it.
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "orphan"},
+    ]
+    messages = build_messages(fake_companion(), "warm", "", "", history, "latest")
+    assert [m["role"] for m in messages[1:]] == ["user", "assistant", "user"]
+    assert messages[-1]["content"] == "orphan" + chr(10) + "latest"

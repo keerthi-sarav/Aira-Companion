@@ -244,12 +244,9 @@ async def add_message(
 
 # ---------- pending tool turns ----------
 
-async def sweep_expired_turns(session: AsyncSession, tenant_id: str, now: Any) -> None:
-    await session.execute(
-        delete(CompanionPendingTurn).where(
-            CompanionPendingTurn.tenant_id == tenant_id, CompanionPendingTurn.expires_at <= now
-        )
-    )
+async def sweep_expired_turns(session: AsyncSession, now: Any) -> None:
+    """Global on purpose: deletes only rows already past expires_at, for every tenant. Safe across tenants."""
+    await session.execute(delete(CompanionPendingTurn).where(CompanionPendingTurn.expires_at <= now))
 
 
 async def create_pending_turn(
@@ -262,7 +259,7 @@ async def create_pending_turn(
     round_no: int,
 ) -> CompanionPendingTurn:
     now = utcnow()
-    await sweep_expired_turns(session, tenant_id, now)
+    await sweep_expired_turns(session, now)
     turn = CompanionPendingTurn(
         id=new_id(),
         tenant_id=tenant_id,
@@ -279,23 +276,24 @@ async def create_pending_turn(
     return turn
 
 
-async def get_pending_turn(
+async def claim_pending_turn(
     session: AsyncSession, tenant_id: str, turn_id: str, now: Any
 ) -> CompanionPendingTurn | None:
+    """Atomically take a paused turn. Only one caller can get the row; a second claim matches nothing.
+
+    DELETE ... RETURNING (SQLite >= 3.35, Postgres) so the check and the delete are one statement.
+    """
     result = await session.execute(
-        select(CompanionPendingTurn).where(
-            CompanionPendingTurn.id == turn_id, CompanionPendingTurn.tenant_id == tenant_id
+        delete(CompanionPendingTurn)
+        .where(
+            CompanionPendingTurn.id == turn_id,
+            CompanionPendingTurn.tenant_id == tenant_id,
+            CompanionPendingTurn.expires_at > now,
         )
+        .returning(CompanionPendingTurn)
+        .execution_options(synchronize_session=False)
     )
-    turn = result.scalar_one_or_none()
-    if turn is None or turn.expires_at <= now:
-        return None
-    return turn
-
-
-async def delete_pending_turn(session: AsyncSession, turn: CompanionPendingTurn) -> None:
-    await session.delete(turn)
-    await session.flush()
+    return result.scalars().first()
 
 
 # ---------- forget me ----------

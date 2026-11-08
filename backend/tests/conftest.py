@@ -9,11 +9,11 @@ from typing import Any  # noqa: E402
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
+from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
 import app.companion.models  # noqa: E402,F401  (registers tables)
 from app.companion.llm import FakeLLM, get_llm  # noqa: E402
-from app.core.db import Base, get_session  # noqa: E402
+from app.core.db import Base, get_session, make_engine  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -21,7 +21,7 @@ from app.main import app  # noqa: E402
 async def db(tmp_path) -> AsyncIterator[async_sessionmaker]:  # type: ignore[type-arg]
     """Fresh temp SQLite database per test. Yields a session factory."""
     url = f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}"
-    engine = create_async_engine(url)
+    engine = make_engine(url)  # production engine settings: WAL, busy timeout, hide_parameters
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield async_sessionmaker(engine, expire_on_commit=False)

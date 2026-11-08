@@ -2,7 +2,7 @@
 
 import { FormEvent, useState } from "react";
 import { errorText } from "@/lib/api";
-import { INDUSTRY_LABELS, LIMITS, cleanList } from "@/lib/companion";
+import { INDUSTRY_LABELS, LIMITS, cleanList, pickFormValues } from "@/lib/companion";
 import type { CompanionFormValues, Industry, Mood, PrivacyMode } from "@/lib/types";
 import { MOOD_META, MOODS } from "./MoodBadge";
 
@@ -13,14 +13,19 @@ interface CharacterFormProps {
   initial: CompanionFormValues;
   submitLabel: string;
   onSubmit: (values: CompanionFormValues) => Promise<void>;
+  /** Blocks submit while something else (for example a status change) is in flight. */
+  disabled?: boolean;
 }
 
 function lengthError(value: string, max: number): string | undefined {
   return value.length > max ? `Maximum ${max} characters.` : undefined;
 }
 
-function listError(items: string[], max: number): string | undefined {
-  return cleanList(items).length > max ? `At most ${max} items.` : undefined;
+function listError(items: string[], max: number, itemMax: number): string | undefined {
+  const cleaned = cleanList(items);
+  if (cleaned.length > max) return `At most ${max} items.`;
+  if (cleaned.some((item) => item.length > itemMax)) return `Each item can be at most ${itemMax} characters.`;
+  return undefined;
 }
 
 function validate(v: CompanionFormValues): FieldErrors {
@@ -31,24 +36,30 @@ function validate(v: CompanionFormValues): FieldErrors {
     speaking_style: lengthError(v.speaking_style, LIMITS.speaking_style),
     temperament: lengthError(v.temperament, LIMITS.temperament),
     language: lengthError(v.language, LIMITS.language),
-    sample_lines: listError(v.sample_lines, LIMITS.sample_lines),
-    goals: listError(v.goals, LIMITS.goals),
-    rules: listError(v.rules, LIMITS.rules),
+    sample_lines: listError(v.sample_lines, LIMITS.sample_lines, LIMITS.list_item),
+    goals: listError(v.goals, LIMITS.goals, LIMITS.list_item),
+    rules: listError(v.rules, LIMITS.rules, LIMITS.list_item),
+    knowledge_tag_id: lengthError((v.knowledge_tag_id ?? "").trim(), LIMITS.knowledge_tag_id),
+    fallback_line: lengthError(v.fallback_line, LIMITS.fallback_line),
   };
   return Object.fromEntries(
     Object.entries(all).filter(([, message]) => Boolean(message)),
   ) as FieldErrors;
 }
 
-/** Trims names and list rows and maps an empty knowledge tag to null before sending. */
+/**
+ * Builds the request body from the whitelisted card fields only (see pickFormValues).
+ * Trims names and list rows and maps an empty knowledge tag to null.
+ */
 function normalize(v: CompanionFormValues): CompanionFormValues {
-  const tag = v.knowledge_tag_id?.trim() ?? "";
+  const picked = pickFormValues(v);
+  const tag = picked.knowledge_tag_id?.trim() ?? "";
   return {
-    ...v,
-    name: v.name.trim(),
-    sample_lines: cleanList(v.sample_lines),
-    goals: cleanList(v.goals),
-    rules: cleanList(v.rules),
+    ...picked,
+    name: picked.name.trim(),
+    sample_lines: cleanList(picked.sample_lines),
+    goals: cleanList(picked.goals),
+    rules: cleanList(picked.rules),
     knowledge_tag_id: tag || null,
   };
 }
@@ -154,6 +165,7 @@ function ListField({
   label,
   values,
   max,
+  itemMax,
   placeholder,
   hint,
   error,
@@ -162,6 +174,7 @@ function ListField({
   label: string;
   values: string[];
   max: number;
+  itemMax: number;
   placeholder?: string;
   hint?: string;
   error?: string;
@@ -184,6 +197,7 @@ function ListField({
               aria-label={`${label} ${index + 1}`}
               className="input"
               value={item}
+              maxLength={itemMax}
               placeholder={placeholder}
               onChange={(e) => {
                 const next = [...values];
@@ -215,7 +229,7 @@ function ListField({
   );
 }
 
-export default function CharacterForm({ initial, submitLabel, onSubmit }: CharacterFormProps) {
+export default function CharacterForm({ initial, submitLabel, onSubmit, disabled = false }: CharacterFormProps) {
   const [values, setValues] = useState<CompanionFormValues>(initial);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [busy, setBusy] = useState(false);
@@ -332,6 +346,7 @@ export default function CharacterForm({ initial, submitLabel, onSubmit }: Charac
           label="Sample lines"
           values={values.sample_lines}
           max={LIMITS.sample_lines}
+          itemMax={LIMITS.list_item}
           placeholder="A line the character might say"
           hint="Used as tone examples only, never as scripts."
           error={errors.sample_lines}
@@ -341,6 +356,7 @@ export default function CharacterForm({ initial, submitLabel, onSubmit }: Charac
           label="Goals (in order)"
           values={values.goals}
           max={LIMITS.goals}
+          itemMax={LIMITS.list_item}
           placeholder="A goal for the conversation"
           error={errors.goals}
           onChange={(v) => set("goals", v)}
@@ -349,6 +365,7 @@ export default function CharacterForm({ initial, submitLabel, onSubmit }: Charac
           label="Rules"
           values={values.rules}
           max={LIMITS.rules}
+          itemMax={LIMITS.list_item}
           placeholder="A rule the character must follow"
           error={errors.rules}
           onChange={(v) => set("rules", v)}
@@ -387,23 +404,27 @@ export default function CharacterForm({ initial, submitLabel, onSubmit }: Charac
           id="knowledge_tag_id"
           label="Knowledge tag (optional)"
           value={values.knowledge_tag_id ?? ""}
+          max={LIMITS.knowledge_tag_id}
           placeholder="Leave empty to use untagged books only"
           hint="The character reads books with this tag plus untagged books."
+          error={errors.knowledge_tag_id}
           onChange={(v) => set("knowledge_tag_id", v)}
         />
         <TextField
           id="fallback_line"
           label="Fallback line"
           value={values.fallback_line}
+          max={LIMITS.fallback_line}
           rows={2}
           multiline
           hint="Shown to the person when the model fails."
+          error={errors.fallback_line}
           onChange={(v) => set("fallback_line", v)}
         />
       </fieldset>
 
       <div className="flex flex-wrap items-center gap-3">
-        <button type="submit" className="btn btn-primary" disabled={busy}>
+        <button type="submit" className="btn btn-primary" disabled={busy || disabled}>
           {busy ? "Saving..." : submitLabel}
         </button>
         {formError ? (

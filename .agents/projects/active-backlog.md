@@ -19,3 +19,7 @@ Roadmap follows the flow spec's week labels.
 - No Alembic migrations — tables are created with `create_all` on startup.
 - Postgres RLS (enabled, no policies) not set up; only app-level tenant filtering.
 - Global in-process semaphore — won't hold across multiple workers/instances.
+- Postgres path untested (RETURNING claim, column lengths, hide_parameters only verified on SQLite) — add a Postgres CI job.
+- A paused tool turn is lost on dashboard reload (history doesn't return pending turns); it just expires after 2 min.
+- Week 2 public API must: re-check `paused` on continue, and bind a `turn_id` to the end user that started it (today only tenant-bound).
+- No frontend tests yet.
